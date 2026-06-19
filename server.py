@@ -1,48 +1,62 @@
 from flask import Flask, request, jsonify
 import time
+import threading
 
 app = Flask(__name__)
 
-# Ukládáme aktivace jako seznam: {"group": 13, "timestamp": 1234567890.123}
+# Uložené aktivace: seznam {"group": int, "timestamp": float, "sender_id": str}
 activations = []
+lock = threading.Lock()
 
-# Jak dlouho (v sekundách) si pamatujeme aktivace
-RETENTION_SECONDS = 10
+# Jak dlouho (v sekundách) zůstává aktivace "platná" pro polling
+ACTIVATION_LIFETIME = 5.0
 
-@app.route("/")
-def home():
-    return "Co-op Trigger Server běží!"
 
 @app.route("/activate", methods=["POST"])
 def activate():
     data = request.get_json()
-    group = data.get("group")
-    if group is None:
+    if not data or "group" not in data:
         return jsonify({"error": "missing group"}), 400
 
-    activations.append({"group": group, "timestamp": time.time()})
-    print(f"Aktivace přijata: group={group}")
+    group = data["group"]
+    sender_id = data.get("sender_id", "unknown")
+
+    with lock:
+        activations.append({
+            "group": group,
+            "timestamp": time.time(),
+            "sender_id": sender_id
+        })
+        cutoff = time.time() - ACTIVATION_LIFETIME
+        activations[:] = [a for a in activations if a["timestamp"] > cutoff]
+
+    print(f"[Server] Aktivace skupiny {group} od {sender_id}")
     return jsonify({"status": "ok"})
+
 
 @app.route("/poll", methods=["GET"])
 def poll():
-    # since = timestamp posledni aktivace kterou klient uz zpracoval
     since = float(request.args.get("since", 0))
-    now = time.time()
+    sender_id = request.args.get("sender_id", "")
 
-    # Vycistime stare zaznamy
-    global activations
-    activations = [a for a in activations if now - a["timestamp"] < RETENTION_SECONDS]
-
-    # Vratime jen nove aktivace
-    new_activations = [a for a in activations if a["timestamp"] > since]
+    with lock:
+        new_activations = [
+            a for a in activations
+            if a["timestamp"] > since and a["sender_id"] != sender_id
+        ]
 
     return jsonify({
         "activations": new_activations,
-        "server_time": now
+        "server_time": time.time()
     })
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "running", "active_count": len(activations)})
+
 
 if __name__ == "__main__":
     import os
-    port = int(os.environ.get("PORT", 8765))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
